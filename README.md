@@ -116,3 +116,5 @@ The client will run the test and print its latency statistics. The server will p
 -   **优化与最终结论**: 通过使用 `setsockopt` 将客户端和服务器的 Socket 缓冲区大小手动增加到 8MB（足以容纳整个消息），原生 Unix Socket 的性能得到了极大提升。优化后，其平均 RTT 降低至 **2453 µs**，最终略微优于 ZMQ。
 
 这证明了 ZMQ 作为一个高度优化的库，其默认配置在多种场景下表现优异。然而，对于特定的高性能场景，**直接使用原生 Socket 并进行仔细的参数调优（尤其是缓冲区大小），可以获得极致的性能**。
+
+-   **小包性能 (4KB)**: 对于小尺寸的消息，原生 Socket 的优势更加明显。测试显示其 RTT 约为 **~140 µs**，显著优于 ZMQ 的 **~185 µs**。这说明在延迟敏感的小包场景下，绕过 ZMQ 的抽象层能带来更显著的性能提升。

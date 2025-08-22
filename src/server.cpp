@@ -167,12 +167,16 @@ int main (int argc, char* argv[]) {
 
         std::cout << "Unix socket server listening on " << socket_path << std::endl;
 
-        if ((client_fd = accept(server_fd, NULL, NULL)) < 0) {
-            perror("accept failed");
-            exit(EXIT_FAILURE);
-        }
+        while (true) { // Main loop to accept new connections
+            std::cout << "Waiting for a new client connection..." << std::endl;
+            if ((client_fd = accept(server_fd, NULL, NULL)) < 0) {
+                perror("accept failed");
+                // In case of non-fatal accept error, just continue
+                continue;
+            }
+            std::cout << "Client connected." << std::endl;
 
-        // Set larger socket buffer sizes
+            // Set larger socket buffer sizes
         int buffer_size = 8 * 1024 * 1024; // 8MB
         if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
             perror("setsockopt SO_RCVBUF failed");
@@ -216,7 +220,11 @@ int main (int argc, char* argv[]) {
                 request_count = 0;
             }
         }
-        close(client_fd);
+        close(client_fd); // Close the connection to this specific client
+        std::cout << "Client connection closed." << std::endl;
+        } // End of main accept loop
+
+        // The following lines are now theoretically unreachable unless the server is stopped with a signal
         close(server_fd);
         unlink(socket_path);
         return 0;
