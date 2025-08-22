@@ -4,6 +4,9 @@
 #include <vector>
 #include <algorithm> // For std::fill, std::shuffle
 #include <random>    // For std::random_device, std::mt19937
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include <chrono>
 #include "src/tlm_payload.capnp.h"
@@ -12,6 +15,36 @@
 
 #include "tlm_payload.h" // For the C++ struct
 #include "stats.h"
+
+// --- Unix Socket Helpers ---
+bool read_all(int fd, void* buf, size_t size) {
+    char* p = static_cast<char*>(buf);
+    size_t remaining = size;
+    while (remaining > 0) {
+        ssize_t bytes_read = read(fd, p, remaining);
+        if (bytes_read <= 0) {
+            return false; // Error or server disconnected
+        }
+        p += bytes_read;
+        remaining -= bytes_read;
+    }
+    return true;
+}
+
+bool write_all(int fd, const void* buf, size_t size) {
+    const char* p = static_cast<const char*>(buf);
+    size_t remaining = size;
+    while (remaining > 0) {
+        ssize_t bytes_written = write(fd, p, remaining);
+        if (bytes_written < 0) {
+            return false; // Error
+        }
+        p += bytes_written;
+        remaining -= bytes_written;
+    }
+    return true;
+}
+// ---
 
 // --- Cap'n Proto Mode ---
 void build_capnp_message(::capnp::MallocMessageBuilder& message, uint64_t id,
@@ -67,7 +100,7 @@ int main (int argc, char* argv[])
 {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <mode> <size_kb> [num_requests]" << std::endl;
-        std::cerr << "  mode: capnp or direct" << std::endl;
+        std::cerr << "  mode: capnp-packed, capnp-flat, direct, or direct-unix" << std::endl;
         std::cerr << "  size_kb: 4 or 4096" << std::endl;
         return 1;
     }
@@ -76,16 +109,44 @@ int main (int argc, char* argv[])
     size_t payload_size = std::stoul(argv[2]) * 1024;
     int num_requests = (argc > 3) ? std::stoi(argv[3]) : 1000;
 
-    if ((mode != "capnp-packed" && mode != "capnp-flat" && mode != "direct") || (payload_size != 4096 && payload_size != 4096 * 1024)) {
-        std::cerr << "Invalid arguments. Mode must be 'capnp-packed', 'capnp-flat', or 'direct'." << std::endl;
+    if ((mode != "capnp-packed" && mode != "capnp-flat" && mode != "direct" && mode != "direct-unix") || (payload_size != 4096 && payload_size != 4096 * 1024)) {
+        std::cerr << "Invalid arguments. Mode must be one of 'capnp-packed', 'capnp-flat', 'direct', 'direct-unix'." << std::endl;
         return 1;
     }
 
     //  Prepare our context and socket
     zmq::context_t context (1);
     zmq::socket_t socket (context, ZMQ_REQ);
+    int client_fd = -1;
+    const char* socket_path = "/tmp/capnproto-test.sock";
 
-    socket.connect ("tcp://localhost:5555");
+    if (mode == "direct-unix") {
+        struct sockaddr_un address;
+        if ((client_fd = ::socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+            perror("socket failed");
+            return 1;
+        }
+
+        // Set larger socket buffer sizes
+        int buffer_size = 8 * 1024 * 1024; // 8MB
+        if (setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+            perror("setsockopt SO_SNDBUF failed");
+        }
+        if (setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) < 0) {
+            perror("setsockopt SO_RCVBUF failed");
+        }
+
+        address.sun_family = AF_UNIX;
+        strncpy(address.sun_path, socket_path, sizeof(address.sun_path) - 1);
+
+        if (connect(client_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+            perror("connect failed");
+            return 1;
+        }
+        std::cout << "Connected to unix socket server." << std::endl;
+    } else {
+        socket.connect ("tcp://localhost:5555");
+    }
 
     // --- Pre-run to determine message sizes ---
     std::vector<uint8_t> pre_run_payload(payload_size);
@@ -135,7 +196,7 @@ int main (int argc, char* argv[])
     for (int request_nbr = 0; request_nbr != num_requests; request_nbr++) {
         zmq::message_t request;
         
-        if (mode == "direct") {
+        if (mode == "direct" || mode == "direct-unix") {
             auto ser_start = std::chrono::high_resolution_clock::now();
             request = build_direct_message(request_nbr, payload);
             auto ser_end = std::chrono::high_resolution_clock::now();
@@ -174,11 +235,38 @@ int main (int argc, char* argv[])
         
         auto rtt_start = std::chrono::high_resolution_clock::now();
 
-        socket.send (request, zmq::send_flags::none);
+        if (mode == "direct-unix") {
+            uint32_t msg_size = request.size();
+            if (!write_all(client_fd, &msg_size, sizeof(msg_size)) || !write_all(client_fd, request.data(), msg_size)) {
+                std::cerr << "Error writing to server." << std::endl;
+                break;
+            }
 
-        //  Get the reply.
-        zmq::message_t reply;
-        (void)socket.recv (reply, zmq::recv_flags::none);
+            uint32_t reply_size;
+            if (!read_all(client_fd, &reply_size, sizeof(reply_size))) {
+                std::cerr << "Error reading reply size from server." << std::endl;
+                break;
+            }
+
+            if (reply_size != msg_size) {
+                 std::cerr << "Error: reply size mismatch. Expected " << msg_size << " got " << reply_size << std::endl;
+                 break;
+            }
+
+            // We need a buffer to read the reply into, but we don't actually use the data.
+            // Let's reuse the zmq::message_t as a buffer to avoid another large allocation.
+            request.rebuild(reply_size);
+            if (!read_all(client_fd, request.data(), reply_size)) {
+                std::cerr << "Error reading reply payload from server." << std::endl;
+                break;
+            }
+
+        } else {
+            socket.send (request, zmq::send_flags::none);
+            //  Get the reply.
+            zmq::message_t reply;
+            (void)socket.recv (reply, zmq::recv_flags::none);
+        }
 
         auto rtt_end = std::chrono::high_resolution_clock::now();
         double rtt_duration_us = std::chrono::duration_cast<std::chrono::microseconds>(rtt_end - rtt_start).count();
@@ -196,6 +284,10 @@ int main (int argc, char* argv[])
     
     std::cout << "\n--- Network RTT + Deserialization Stats ---" << std::endl;
     rtt_stats.calculate();
+
+    if (client_fd != -1) {
+        close(client_fd);
+    }
 
     return 0;
 }
