@@ -29,10 +29,21 @@ void handle_direct_message(const zmq::message_t& request, Stats& stats) {
     auto start = std::chrono::high_resolution_clock::now();
     
     // Simulate a real-world scenario where data must be copied out of the ZMQ buffer
-    // before processing can continue asynchronously.
+    // and then accessed in a structured way.
     char* local_copy = new char[request.size()];
     memcpy(local_copy, request.data(), request.size());
-    // In a real app, you'd store/use local_copy. Here we delete it to avoid leaks.
+
+    // 1. Cast the copied buffer to the struct type.
+    ssln::hybrid::TlmPayload* header = reinterpret_cast<ssln::hybrid::TlmPayload*>(local_copy);
+
+    // 2. Reconstruct the data pointer.
+    header->data = reinterpret_cast<uint8_t*>(local_copy + sizeof(ssln::hybrid::TlmPayload));
+
+    // 3. Read a field to prevent optimization. A volatile variable helps ensure this.
+    volatile uint64_t id = header->id;
+    (void)id; // Suppress unused variable warning
+
+    // In a real app, you'd store/use the header pointer. Here we delete it to avoid leaks.
     delete[] local_copy;
 
     auto end = std::chrono::high_resolution_clock::now();
