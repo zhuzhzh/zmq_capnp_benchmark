@@ -106,3 +106,13 @@ The client will run the test and print its latency statistics. The server will p
 -   **网络是瓶颈时**: 在广域网（WAN）或低带宽网络下，`capnp-packed` 带来的网络传输优势将变得至关重要。
 -   **数据结构复杂时**: 当数据不再是单个二进制块，而是包含大量字段、字符串和嵌套结构时，Cap'n Proto 在开发效率、代码可维护性和协议安全性上的优势将远超手写 `memcpy`。
 -   **需要随机访问时**: 如果接收端只需要读取消息中的一两个字段，Cap'n Proto 的“原地读取”特性可以避免解包整个消息，开销极小。
+
+### 附录: IPC 传输方式对比 (ZMQ vs Raw Unix Socket)
+
+在 `direct` 模式的基础上，我们还对比了 ZMQ (TCP loopback) 和原生 Unix Domain Socket 作为底层 IPC 传输方式的性能差异。
+
+-   **初步测试**: 在一个简单的实现中，ZMQ 的性能出人意料地超过了原生 Socket。在 4MB 负载的测试下，ZMQ 的平均 RTT 约为 **2559 µs**，而原生 Socket 实现则高达 **5523 µs**。
+-   **问题定位**: 经过分析，性能瓶颈在于原生 Socket 实现采用了系统默认的内核收发缓冲区（`SO_SNDBUF`, `SO_RCVBUF`）。对于大尺寸消息，过小的默认缓冲区导致了大量的 `read()`/`write()` 系统调用，从而产生了巨大的延迟开销。
+-   **优化与最终结论**: 通过使用 `setsockopt` 将客户端和服务器的 Socket 缓冲区大小手动增加到 8MB（足以容纳整个消息），原生 Unix Socket 的性能得到了极大提升。优化后，其平均 RTT 降低至 **2453 µs**，最终略微优于 ZMQ。
+
+这证明了 ZMQ 作为一个高度优化的库，其默认配置在多种场景下表现优异。然而，对于特定的高性能场景，**直接使用原生 Socket 并进行仔细的参数调优（尤其是缓冲区大小），可以获得极致的性能**。
